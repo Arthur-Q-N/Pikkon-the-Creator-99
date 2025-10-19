@@ -31,6 +31,7 @@ from huggingface_hub import InferenceClient
 from google.colab import userdata
 import time
 import gradio as gr
+import google.generativeai as genai
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,12 +71,13 @@ class ConfigManager:
                 self.hf_api_key = userdata.get('HF_TOKEN')
 
             self.poe_api_key = userdata.get('POE_API_KEY')
+            self.gemini_api_key = userdata.get('GEMINI_API_KEY')
 
         except Exception as e:
             logger.error("Configure as API Keys no Colab Secrets (ícone de chave 🔑)")
-            raise ValueError("API Keys não encontradas. Adicione HUGGINGFACE_API_KEY e POE_API_KEY nos Secrets do Colab")
+            raise ValueError("API Keys não encontradas. Adicione HUGGINGFACE_API_KEY, POE_API_KEY e GEMINI_API_KEY nos Secrets do Colab")
 
-        if not self.hf_api_key or not self.poe_api_key:
+        if not self.hf_api_key or not self.poe_api_key or not self.gemini_api_key:
             raise ValueError("API Keys vazias. Verifique os Secrets do Colab")
 
         os.environ['HF_TOKEN'] = self.hf_api_key
@@ -116,10 +118,11 @@ class AudioProcessor:
 # ============================================================================
 
 class TranscriptionService:
-    MODEL = "mistralai/Voxtral-Small-24B-2507"
+    MODEL = "gemini-2.5-pro"
 
-    def __init__(self, hf_api_key: str):
-        self.client = InferenceClient(token=hf_api_key)
+    def __init__(self, gemini_api_key: str):
+        genai.configure(api_key=gemini_api_key)
+        self.model = genai.GenerativeModel(self.MODEL)
         logger.info(f"Serviço de transcrição inicializado: {self.MODEL}")
 
     def transcribe(self, audio_path: Path) -> Optional[str]:
@@ -127,12 +130,25 @@ class TranscriptionService:
             with open(audio_path, 'rb') as audio_file:
                 audio_data = audio_file.read()
 
-            response = self.client.automatic_speech_recognition(
-                audio_data,
-                model=self.MODEL
-            )
+            # Upload do arquivo de áudio para o Gemini
+            audio_file = genai.upload_file(path=str(audio_path))
+            
+            # Aguardar o processamento do arquivo
+            while audio_file.state.name == "PROCESSING":
+                time.sleep(2)
+                audio_file = genai.get_file(audio_file.name)
+            
+            if audio_file.state.name == "FAILED":
+                logger.error("Falha no upload do arquivo de áudio")
+                return None
 
-            transcription = response.get('text', '')
+            # Transcrever o áudio
+            response = self.model.generate_content([
+                "Transcreva este áudio para texto em português brasileiro. Retorne apenas o texto transcrito, sem formatação adicional.",
+                audio_file
+            ])
+
+            transcription = response.text.strip()
             logger.info(f"Transcrição concluída: {len(transcription)} caracteres")
             return transcription
 
@@ -703,7 +719,7 @@ class VideoCompiler:
 class YouTubeShortsOrchestrator:
     def __init__(self, config: ConfigManager):
         self.config = config
-        self.transcriber = TranscriptionService(config.hf_api_key)
+        self.transcriber = TranscriptionService(config.gemini_api_key)
         self.agent1 = Agent1ContentGenerator(config.hf_api_key)
         self.agent2 = Agent2Optimizer(config.poe_api_key)
         self.audio_processor = AudioProcessor()
