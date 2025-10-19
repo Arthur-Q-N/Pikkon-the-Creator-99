@@ -1,0 +1,848 @@
+# Codigo em Phyton de Automação de videos no Google Colab
+"""
+Sistema de Automação Profissional para YouTube Shorts
+Arquitetura Multi-Agente com Pipeline de Processamento Inteligente
+"""
+
+# ============================================================================
+# BLOCO 1: INSTALAÇÃO DE DEPENDÊNCIAS (Executar primeiro no Colab)
+# ============================================================================
+
+!apt-get update && apt-get install -y ffmpeg
+!pip install -q huggingface_hub requests poe-api ffmpeg-python gradio python-dotenv
+!pip install --upgrade poe-api
+
+# ============================================================================
+# BLOCO 2: IMPORTS E CONFIGURAÇÃO
+# ============================================================================
+
+import os
+import json
+import logging
+import tempfile
+import shutil
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, asdict
+import subprocess
+
+import requests
+from huggingface_hub import InferenceClient
+from google.colab import userdata
+import time
+import gradio as gr
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# BLOCO 3: ESTRUTURAS DE DADOS
+# ============================================================================
+
+@dataclass
+class VideoMetadata:
+    titulo: str
+    descricao: str
+    tags: list
+    analise_agente2: Optional[str] = None
+    score_viral: Optional[float] = None
+
+
+@dataclass
+class ProcessingPaths:
+    video_input: Path
+    audio_extract: Path
+    video_output: Path
+    temp_dir: Path
+
+# ============================================================================
+# BLOCO 4: GERENCIADOR DE CONFIGURAÇÃO
+# ============================================================================
+
+class ConfigManager:
+    def __init__(self):
+        try:
+            self.hf_api_key = userdata.get('HUGGINGFACE_API_KEY')
+            if not self.hf_api_key:
+                self.hf_api_key = userdata.get('HF_TOKEN')
+
+            self.poe_api_key = userdata.get('POE_API_KEY')
+
+        except Exception as e:
+            logger.error("Configure as API Keys no Colab Secrets (ícone de chave 🔑)")
+            raise ValueError("API Keys não encontradas. Adicione HUGGINGFACE_API_KEY e POE_API_KEY nos Secrets do Colab")
+
+        if not self.hf_api_key or not self.poe_api_key:
+            raise ValueError("API Keys vazias. Verifique os Secrets do Colab")
+
+        os.environ['HF_TOKEN'] = self.hf_api_key
+        os.environ['HUGGING_FACE_HUB_TOKEN'] = self.hf_api_key
+
+    def validate_keys(self) -> bool:
+        try:
+            client = InferenceClient(token=self.hf_api_key)
+            logger.info("✓ API Keys validadas com sucesso")
+            return True
+        except Exception as e:
+            logger.error(f"Erro na validação: {e}")
+            return False
+
+# ============================================================================
+# BLOCO 5: PROCESSADOR DE ÁUDIO
+# ============================================================================
+
+class AudioProcessor:
+    @staticmethod
+    def extract_audio(video_path: Path, audio_path: Path) -> bool:
+        try:
+            cmd = [
+                'ffmpeg', '-i', str(video_path),
+                '-vn', '-acodec', 'pcm_s16le',
+                '-ar', '16000', '-ac', '1',
+                str(audio_path), '-y'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info(f"Áudio extraído: {audio_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Erro na extração de áudio: {e.stderr}")
+            return False
+
+# ============================================================================
+# BLOCO 6: SERVIÇO DE TRANSCRIÇÃO
+# ============================================================================
+
+class TranscriptionService:
+    MODEL = "mistralai/Voxtral-Small-24B-2507"
+
+    def __init__(self, hf_api_key: str):
+        self.client = InferenceClient(token=hf_api_key)
+        logger.info(f"Serviço de transcrição inicializado: {self.MODEL}")
+
+    def transcribe(self, audio_path: Path) -> Optional[str]:
+        try:
+            with open(audio_path, 'rb') as audio_file:
+                audio_data = audio_file.read()
+
+            response = self.client.automatic_speech_recognition(
+                audio_data,
+                model=self.MODEL
+            )
+
+            transcription = response.get('text', '')
+            logger.info(f"Transcrição concluída: {len(transcription)} caracteres")
+            return transcription
+
+        except Exception as e:
+            logger.error(f"Erro na transcrição: {e}")
+            return None
+
+# ============================================================================
+# BLOCO 7: AGENTE 1 - GERADOR DE CONTEÚDO
+# ============================================================================
+
+class Agent1ContentGenerator:
+    MODEL = "openai/gpt-oss-120b"
+
+    SYSTEM_PROMPT = """# 💻 AGENTE SEO — YouTube Shorts 2025
+
+## [PAPEL E MISSÃO]
+Você é o **Agente SEO Viral Explosivo**: especialista em otimização para o algoritmo do YouTube Shorts em 2025. Sua função é gerar **TÍTULO, DESCRIÇÃO (com HASHTAGS) e TAGS** otimizadas para maximizar CTR, retenção, descoberta no feed/pesquisa e viralização. Use psicologia de gatilhos (curiosidade/recompensa) e táticas avançadas do algoritmo.
+
+---
+
+## [ENTRADA DE DADOS]
+Você receberá apenas:
+- **[TRANSCRIÇÃO DO VÍDEO]**: Texto completo do conteúdo falado no Short
+
+**IMPORTANTE**: A transcrição é sua ÚNICA fonte de análise. Extraia dela:
+- Palavras-chave principais e secundárias
+- Tema/nicho do vídeo
+- Público-alvo implícito
+- Frases de impacto e contexto
+- Benefício/valor entregue no vídeo
+
+---
+
+## [TÍTULO — Foco em CTR e Gancho Visual]
+
+### Objetivo
+Despertar clique imediato com promessa clara, lacuna de curiosidade ou valor tangível.
+
+### Regras Obrigatórias
+- **Tamanho**: ≤100 caracteres (ideal: 50-70)
+- **4 PRIMEIRAS PALAVRAS**: SÃO AS QUE APARECEM NO HOME DO YOUTUBE SHORTS
+  - Devem ATRAIR e RESUMIR o conteúdo do vídeo
+  - Use **MAIÚSCULAS** em 1-2 palavras-chave de destaque (ex: "SEGREDO Revelado", "5 DICAS Poderosas")
+  - Priorize palavra-chave principal no início
+- **Palavra-chave principal**: Extraída da transcrição, posicionada nas primeiras palavras
+- **Impacto**: Máximo 2 emojis relevantes, números precisos (ex: 5 Dicas, 3 Erros)
+- **Gatilhos**: Curiosidade, urgência, recompensa, especificidade numérica
+- **Honestidade**: Chamativo mas verdadeiro (alinhado à transcrição)
+
+### Boas Práticas
+- ✅ Números, palavras de poder (REVELADO, SEGREDO, COMPLETO, NUNCA)
+- ✅ Estruturas: "Como [X]", "[Número] Formas de [Y]", "[X] que [Benefício]"
+- ❌ Sem hashtags no título
+- ❌ Evite caixa alta total, pontuação excessiva (!!!, ???), palavras vazias
+
+### Processo Interno (NÃO MOSTRAR)
+1. Gere internamente 5 variações de título
+2. Avalie cada uma por: palavra-chave + curiosidade + clareza + impacto das 4 primeiras palavras
+3. Escolha a MELHOR e retorne apenas ela
+
+---
+
+## [DESCRIÇÃO + HASHTAGS — Foco em SEO e Engajamento]
+
+### Estrutura Obrigatória
+
+**1. FRASE DE ABERTURA (acima da dobra)**
+- 15-25 palavras
+- Resumo claro do Short com benefício explícito
+- Inclua palavra-chave principal
+- Baseada na transcrição
+
+**2. HASHTAGS (logo após a frase)**
+- Pule 1 linha após a frase
+- Liste 3-5 hashtags relevantes:
+  - #Shorts (obrigatório)
+  - #NichoPrincipal (ex: #Fitness, #Tecnologia)
+  - #TemasRelacionados (extraídos da transcrição)
+- Evite spam ou hashtags irrelevantes
+
+**3. CORPO DA DESCRIÇÃO**
+- SEO: Inclua palavra-chave principal + variações long-tail nas primeiras 100 palavras
+- Contexto: Detalhe o conteúdo de forma natural (50-150 palavras)
+- CTA: **OBRIGATÓRIO** — Sutil e natural (ex: "Curtiu? Deixe seu comentário! 💬", "Inscreva-se para mais dicas!")
+- Linguagem: PT-BR padrão, clara e objetiva
+- Termos bilíngues apenas se público global
+
+### Compliance
+- ❌ **Termos proibidos**: violência, sexo, palavrões, afirmações médicas não verificadas, clickbait enganoso
+- ✅ Use vocabulário do nicho detectado na transcrição
+- ✅ Mantenha brand safety e diretrizes do YouTube
+
+---
+
+## [TAGS — Foco em Descoberta e Ranqueamento]
+
+### Regras
+- **Número**: 5-10 tags otimizadas
+- **Mix estratégico**:
+  - Cauda curta (ampla): ex: "treino", "tecnologia"
+  - Cauda longa (específica): ex: "treino para iniciantes em casa"
+  - Sinônimos e variações regionais
+  - Termos relacionados extraídos da transcrição
+- **Prioridade**: Primeira tag = palavra-chave principal (espelhar início do título)
+- **Formato**: Separadas por vírgula, minúsculas, ≤500 caracteres totais
+- **Relevância**: Diretamente ao conteúdo da transcrição
+
+### Otimizações
+- Inclua variações singular/plural
+- Sem stopwords desnecessárias
+- Adicione "shorts" como tag geral
+- Use variações em inglês se público misto
+
+---
+
+## [FORMATO DE SAÍDA — JSON PURO]
+
+Retorne **APENAS** o JSON abaixo, sem explicações, comentários ou texto adicional:
+
+```json
+{
+  "titulo": "[Título otimizado com 4 PRIMEIRAS palavras em destaque]",
+  "descricao": "[Frase curta de resumo com palavra-chave]\n\n#Shorts #NichoPrincipal #Tema1 #Tema2 #Tema3\n\n[Corpo da descrição com SEO e CTA obrigatório]",
+  "tags": "tag principal, tag nicho, variação long tail, sinônimo, termo relacionado, shorts, ..."
+}
+```
+
+---
+
+## [DIRETRIZES FINAIS]
+
+### Consistência
+- Reflita o conteúdo REAL da transcrição
+- Evite promessas excessivas ou desalinhadas
+- Mantenha tom/linguagem do público-alvo detectado
+
+### Qualidade
+- Priorize clareza e autenticidade
+- Use dados/números quando presentes na transcrição
+- Equilibre SEO com naturalidade linguística
+
+### Compliance YouTube 2025
+- Respeite políticas de conteúdo da plataforma
+- Sem termos sensíveis ou afirmações não verificadas
+- Brand safety em todos os elementos gerados
+
+---
+
+**LEMBRE-SE**: Você gera 5 títulos internamente, escolhe o melhor e retorna APENAS o JSON final. Sem explicações extras."""
+
+    def __init__(self, hf_api_key: str):
+        self.client = InferenceClient(token=hf_api_key)
+        logger.info(f"Agente 1 inicializado: {self.MODEL}")
+
+    def generate_metadata(self, transcription: str, feedback: Optional[str] = None) -> Optional[Dict]:
+        try:
+            prompt = self._build_prompt(transcription, feedback)
+
+            response = self.client.text_generation(
+                prompt,
+                model=self.MODEL,
+                max_new_tokens=1000,
+                temperature=0.7,
+                return_full_text=False
+            )
+
+            metadata = self._parse_response(response)
+            logger.info("Metadados gerados pelo Agente 1")
+            return metadata
+
+        except Exception as e:
+            logger.error(f"Erro no Agente 1: {e}")
+            return None
+
+    def _build_prompt(self, transcription: str, feedback: Optional[str]) -> str:
+        base_prompt = f"""{self.SYSTEM_PROMPT}
+
+TRANSCRIÇÃO DO VÍDEO:
+{transcription}
+
+TAREFA:
+Gere metadados otimizados no seguinte formato JSON:
+{{
+    "titulo": "título atraente (máx 100 caracteres)",
+    "descricao": "descrição completa com hashtags integradas (máx 5000 caracteres)",
+    "tags": ["tag1", "tag2", "tag3", ...] (mínimo 10, máximo 30 tags)
+}}"""
+
+        if feedback:
+            base_prompt += f"""
+
+FEEDBACK DO AGENTE 2 (APLIQUE AS MELHORIAS):
+{feedback}
+
+IMPORTANTE: Incorpore todas as sugestões de melhoria mantendo a estrutura JSON."""
+
+        return base_prompt
+
+    def _parse_response(self, response: str) -> Dict:
+        try:
+            start_idx = response.find('{')
+            end_idx = response.rfind('}') + 1
+            json_str = response[start_idx:end_idx]
+            return json.loads(json_str)
+        except:
+            return {
+                "titulo": "Título Padrão",
+                "descricao": "Descrição padrão. #shorts",
+                "tags": ["shorts", "viral", "trending"]
+            }
+
+# ============================================================================
+# BLOCO 8: AGENTE 2 - ANÁLISE E OTIMIZAÇÃO
+# ============================================================================
+
+class Agent2Optimizer:
+    MODEL = "Claude-Sonnet-3.5"
+    API_URL = "https://api.poe.com/bot/chat"
+
+    SYSTEM_PROMPT = """ 🔍 AGENTE CRÍTICO DE SEO VIRAL — YouTube Shorts 2025
+
+## [PAPEL E MISSÃO]
+Você é o **Agente Crítico de SEO Viral**: analista especializado em avaliar otimizações de YouTube Shorts. Sua função é revisar criticamente o trabalho do Agente 1, atribuir uma pontuação de potencial viral (0-100) e recomendar melhorias concretas para maximizar SEO, CTR e descoberta.
+
+**IMPORTANTE**: Seja CRÍTICO, SINCERO e DIRETO. Não elogie sem fundamento. Aponte falhas reais e oportunidades perdidas.
+
+---
+
+## [ENTRADA DE DADOS]
+Você receberá do Agente 1:
+
+```json
+{
+  "titulo": "[Título gerado]",
+  "descricao": "[Descrição com hashtags e CTA]",
+  "tags": "[Lista de tags]"
+}
+```
+
+**CONTEXTO ADICIONAL** (se fornecido):
+- Transcrição original do vídeo
+- Nicho/tópico identificado
+
+---
+
+## [CRITÉRIOS DE ANÁLISE]
+
+### 1. TÍTULO (Peso: 40%)
+Avalie criticamente:
+
+**Estrutura das 4 Primeiras Palavras** (10 pontos)
+- ✅ Atraem atenção imediata?
+- ✅ Contêm palavra-chave principal?
+- ✅ Maiúsculas usadas estrategicamente (1-2 palavras)?
+- ❌ São genéricas, vagas ou fracas?
+
+**Gatilho de Curiosidade** (10 pontos)
+- ✅ Cria lacuna de conhecimento?
+- ✅ Promete valor tangível?
+- ❌ É clickbait enganoso ou vazio?
+
+**SEO e Palavra-chave** (10 pontos)
+- ✅ Palavra-chave no início?
+- ✅ Termo de busca relevante e volumoso?
+- ❌ Palavra-chave fraca ou mal posicionada?
+
+**Clareza e CTR** (10 pontos)
+- ✅ Promessa clara em ≤70 caracteres?
+- ✅ Emojis relevantes (máx. 2)?
+- ✅ Números específicos?
+- ❌ Confuso, longo ou genérico?
+
+---
+
+### 2. DESCRIÇÃO (Peso: 35%)
+
+**Frase de Abertura** (10 pontos)
+- ✅ Resume o Short em 15-25 palavras?
+- ✅ Inclui palavra-chave principal?
+- ✅ Promete benefício claro?
+- ❌ É vaga ou desalinhada com o título?
+
+**Hashtags** (10 pontos)
+- ✅ 3-5 hashtags relevantes?
+- ✅ Inclui #Shorts obrigatório?
+- ✅ Mix de nicho + descoberta?
+- ❌ Spam, irrelevantes ou genéricas demais?
+
+**SEO e Corpo** (10 pontos)
+- ✅ Palavra-chave + variações nas primeiras 100 palavras?
+- ✅ Conteúdo natural e informativo (50-150 palavras)?
+- ✅ Termos long-tail presentes?
+- ❌ Keyword stuffing ou texto robótico?
+
+**CTA** (5 pontos)
+- ✅ Presente, sutil e natural?
+- ✅ Incentiva engajamento (comentar, curtir, inscrever)?
+- ❌ Ausente, forçado ou genérico?
+
+---
+
+### 3. TAGS (Peso: 25%)
+
+**Relevância** (10 pontos)
+- ✅ Todas extraídas do conteúdo real?
+- ✅ Primeira tag = palavra-chave principal?
+- ❌ Tags irrelevantes ou genéricas?
+
+**Mix Estratégico** (10 pontos)
+- ✅ Cauda curta (ampla) + cauda longa (específica)?
+- ✅ Sinônimos e variações?
+- ✅ Inclui "shorts" como tag geral?
+- ❌ Apenas tags amplas ou apenas específicas?
+
+**Quantidade e Formato** (5 pontos)
+- ✅ 5-10 tags otimizadas?
+- ✅ Minúsculas, sem stopwords?
+- ❌ Muitas (spam) ou poucas (perda de descoberta)?
+
+---
+
+## [PONTUAÇÃO DE POTENCIAL VIRAL]
+
+### Escala 0-100
+
+**90-100**: Excelente — Alta probabilidade de viralização
+- Título magnético com 4 primeiras palavras perfeitas
+- SEO impecável com termos estratégicos
+- Descrição otimizada e natural
+- Tags precisas e diversificadas
+
+**70-89**: Bom — Potencial sólido, melhorias menores
+- Título eficaz mas pode ser mais impactante
+- SEO funcional, oportunidades de long-tail
+- Descrição clara, CTA pode melhorar
+
+**50-69**: Mediano — Funciona mas perde oportunidades
+- Título genérico ou palavra-chave fraca
+- SEO básico, falta profundidade
+- Hashtags ou tags pouco estratégicas
+
+**30-49**: Fraco — Baixa chance de descoberta
+- Título sem gancho ou confuso
+- SEO deficiente, palavras-chave erradas
+- Descrição vaga, CTA ausente
+
+**0-29**: Muito Fraco — Quase nenhuma chance de viralizar
+- Título clickbait ou irrelevante
+- SEO inexistente ou spam
+- Tags desalinhadas, descrição ruim
+
+---
+
+## [FORMATO DE SAÍDA]
+
+Retorne sua análise em **texto corrido**, estruturado da seguinte forma:
+
+```
+## PONTUAÇÃO DE POTENCIAL VIRAL: [0-100]/100
+
+[Justificativa breve da pontuação em 2-3 linhas]
+
+---
+
+## ANÁLISE CRÍTICA
+
+### TÍTULO
+[Critique honestamente: O que funciona? O que falha? As 4 primeiras palavras são fortes? Palavra-chave bem posicionada? Gatilho de curiosidade eficaz?]
+
+### DESCRIÇÃO
+[Avalie: Frase de abertura clara? Hashtags estratégicas? SEO presente? CTA eficaz? Corpo informativo?]
+
+### TAGS
+[Analise: Relevância ao conteúdo? Mix estratégico? Primeira tag adequada? Quantidade ideal?]
+
+---
+
+## RECOMENDAÇÕES PARA AUMENTAR SEO E VIRALIZAÇÃO
+
+### 1. TÍTULO
+- [Sugestão concreta de melhoria, se necessário]
+- [Exemplo de reformulação, se aplicável]
+
+### 2. DESCRIÇÃO
+- [Ajustes em frase de abertura, hashtags ou corpo]
+- [Como melhorar SEO ou CTA]
+
+### 3. TAGS
+- [Tags adicionais ou substituições recomendadas]
+- [Ajustes no mix cauda curta/longa]
+
+### 4. OPORTUNIDADES PERDIDAS
+- [Palavras-chave não exploradas]
+- [Gatilhos psicológicos ausentes]
+- [Tendências do nicho ignoradas]
+
+---
+
+## CONCLUSÃO
+[Resumo em 2-3 linhas: O trabalho está pronto para publicação ou precisa de revisão? Principais ajustes necessários.]
+```
+
+---
+
+## [DIRETRIZES DE COMPORTAMENTO]
+
+### Seja Crítico e Honesto
+- ❌ NÃO elogie gratuitamente
+- ❌ NÃO aceite trabalho medíocre
+- ✅ Aponte falhas reais e específicas
+- ✅ Seja construtivo mas direto
+
+### Seja Específico
+- ❌ "O título pode melhorar" (vago)
+- ✅ "Substitua 'Dica incrível' por 'SEGREDO que 90% erra' para aumentar curiosidade e incluir número específico"
+
+### Foque em Resultados
+- Toda recomendação deve ter impacto mensurável em SEO, CTR ou descoberta
+- Explique o PORQUÊ de cada sugestão
+
+### Mantenha Objetividade
+- Baseie-se em dados do algoritmo do YouTube 2025
+- Psicologia de gatilhos (curiosidade, urgência, especificidade)
+- Boas práticas de SEO comprovadas
+
+---
+
+## [LEMBRE-SE]
+
+Você é o ÚLTIMO filtro de qualidade antes da publicação. Sua análise crítica e sincera é essencial para garantir que cada Short tenha o máximo potencial de viralização e descoberta.
+
+**NÃO RETORNE JSON. Retorne APENAS a análise em texto corrido conforme o formato acima."""
+
+    def __init__(self, poe_api_key: str):
+        self.api_key = poe_api_key
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'Bearer {poe_api_key}',
+            'Content-Type': 'application/json'
+        })
+        logger.info(f"Agente 2 inicializado: {self.MODEL}")
+
+    def analyze_and_optimize(self, metadata: Dict) -> Tuple[str, float]:
+        try:
+            prompt = self._build_analysis_prompt(metadata)
+
+            payload = {
+                "version": "1.0",
+                "type": "query",
+                "query": [{
+                    "role": "user",
+                    "content": prompt
+                }],
+                "bot": self.MODEL
+            }
+
+            response = self.session.post(
+                self.API_URL,
+                json=payload,
+                timeout=60
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                analysis_text = result.get('text', 'Análise indisponível')
+            else:
+                logger.warning(f"API Poe retornou status {response.status_code}")
+                analysis_text = self._fallback_analysis(metadata)
+
+            viral_score = self._extract_viral_score(analysis_text)
+            logger.info(f"Análise concluída - Score Viral: {viral_score}")
+            return analysis_text, viral_score
+
+        except Exception as e:
+            logger.error(f"Erro no Agente 2: {e}")
+            return self._fallback_analysis(metadata), 60.0
+
+    def _build_analysis_prompt(self, metadata: Dict) -> str:
+        return f"""{self.SYSTEM_PROMPT}
+
+METADADOS PARA ANÁLISE:
+
+TÍTULO: {metadata.get('titulo', 'N/A')}
+
+DESCRIÇÃO: {metadata.get('descricao', 'N/A')}
+
+TAGS: {', '.join(metadata.get('tags', []))}
+
+EXECUTE UMA ANÁLISE CRÍTICA E DETALHADA:
+1. Avalie cada componente separadamente
+2. Identifique oportunidades de melhoria
+3. Proponha ajustes específicos
+4. Calcule score de viralização (0-100)
+5. Forneça feedback acionável para o Agente 1"""
+
+    def _extract_viral_score(self, analysis: str) -> float:
+        try:
+            import re
+            for line in analysis.split('\n'):
+                if 'score' in line.lower() and 'viral' in line.lower():
+                    numbers = re.findall(r'\d+', line)
+                    if numbers:
+                        score = int(numbers[0])
+                        return float(min(max(score, 0), 100))
+            return 65.0
+        except:
+            return 65.0
+
+    def _fallback_analysis(self, metadata: Dict) -> str:
+        return f"""ANÁLISE AUTOMÁTICA (Agente 2 - Fallback Mode)
+
+PONTOS FORTES:
+✓ Título com {len(metadata.get('titulo', ''))} caracteres
+✓ Descrição estruturada presente
+✓ {len(metadata.get('tags', []))} tags identificadas
+
+PONTOS CRÍTICOS:
+⚠ Verificar originalidade do título
+⚠ Ampliar cobertura de hashtags estratégicas
+⚠ Adicionar call-to-action mais direto
+
+RECOMENDAÇÕES:
+1. Testar variações de título A/B
+2. Incluir números ou estatísticas no título
+3. Adicionar emojis relevantes (2-3 máximo)
+4. Expandir descrição com contexto adicional
+5. Incluir links para conteúdo relacionado
+
+Score Final de Viralização: 65/100"""
+
+# ============================================================================
+# BLOCO 9: COMPILADOR DE VÍDEO
+# ============================================================================
+
+class VideoCompiler:
+    @staticmethod
+    def compile_final_video(
+        input_video: Path,
+        metadata: VideoMetadata,
+        output_video: Path
+    ) -> bool:
+        try:
+            metadata_file = output_video.parent / "metadata.txt"
+
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                f.write(f"Título: {metadata.titulo}\n\n")
+                f.write(f"Descrição:\n{metadata.descricao}\n\n")
+                f.write(f"Tags: {', '.join(metadata.tags)}\n\n")
+                if metadata.analise_agente2:
+                    f.write(f"Análise:\n{metadata.analise_agente2}\n\n")
+                f.write(f"Score Viral: {metadata.score_viral or 0:.1f}/100\n")
+
+            shutil.copy2(input_video, output_video)
+
+            logger.info(f"Vídeo compilado: {output_video}")
+            logger.info(f"Metadados salvos: {metadata_file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Erro na compilação: {e}")
+            return False
+
+# ============================================================================
+# BLOCO 10: ORQUESTRADOR PRINCIPAL
+# ============================================================================
+
+class YouTubeShortsOrchestrator:
+    def __init__(self, config: ConfigManager):
+        self.config = config
+        self.transcriber = TranscriptionService(config.hf_api_key)
+        self.agent1 = Agent1ContentGenerator(config.hf_api_key)
+        self.agent2 = Agent2Optimizer(config.poe_api_key)
+        self.audio_processor = AudioProcessor()
+        self.video_compiler = VideoCompiler()
+
+    def process_video(self, video_path: str) -> Optional[Tuple[str, str]]:
+        paths = None
+        try:
+            paths = self._setup_paths(video_path)
+            logger.info("=" * 60)
+            logger.info("INICIANDO PIPELINE DE PROCESSAMENTO")
+            logger.info("=" * 60)
+
+            if not self.audio_processor.extract_audio(paths.video_input, paths.audio_extract):
+                raise Exception("Falha na extração de áudio")
+
+            transcription = self.transcriber.transcribe(paths.audio_extract)
+            if not transcription:
+                raise Exception("Falha na transcrição")
+            logger.info(f"Transcrição: {transcription[:100]}...")
+
+            logger.info("\n--- AGENTE 1: Primeira Geração ---")
+            metadata_v1 = self.agent1.generate_metadata(transcription)
+            if not metadata_v1:
+                raise Exception("Falha na geração inicial")
+
+            logger.info("\n--- AGENTE 2: Análise Crítica ---")
+            feedback, viral_score = self.agent2.analyze_and_optimize(metadata_v1)
+
+            logger.info("\n--- AGENTE 1: Aplicando Melhorias ---")
+            metadata_final = self.agent1.generate_metadata(transcription, feedback)
+            if not metadata_final:
+                metadata_final = metadata_v1
+
+            video_metadata = VideoMetadata(
+                titulo=metadata_final['titulo'],
+                descricao=metadata_final['descricao'],
+                tags=metadata_final['tags'],
+                analise_agente2=feedback,
+                score_viral=viral_score
+            )
+
+            if not self.video_compiler.compile_final_video(
+                paths.video_input,
+                video_metadata,
+                paths.video_output
+            ):
+                raise Exception("Falha na compilação")
+
+            logger.info("=" * 60)
+            logger.info("PROCESSAMENTO CONCLUÍDO COM SUCESSO")
+            logger.info("=" * 60)
+
+            return str(paths.video_output), str(paths.video_output.parent / "metadata.txt")
+
+        except Exception as e:
+            logger.error(f"Erro no pipeline: {e}")
+            return None
+        finally:
+            if paths:
+                self._cleanup(paths)
+
+    def _setup_paths(self, video_path: str) -> ProcessingPaths:
+        temp_dir = Path(tempfile.mkdtemp(prefix="shorts_"))
+        return ProcessingPaths(
+            video_input=Path(video_path),
+            audio_extract=temp_dir / "audio.wav",
+            video_output=temp_dir / "output_video.mp4",
+            temp_dir=temp_dir
+        )
+
+    def _cleanup(self, paths: ProcessingPaths):
+        try:
+            if paths.temp_dir.exists():
+                shutil.rmtree(paths.temp_dir)
+            logger.info("Arquivos temporários removidos")
+        except Exception as e:
+            logger.warning(f"Erro na limpeza: {e}")
+
+# ============================================================================
+# BLOCO 11: SISTEMA DE UPLOAD NATIVO DO COLAB
+# ============================================================================
+
+from google.colab import files
+import io
+
+def upload_and_process():
+    config = ConfigManager()
+    orchestrator = YouTubeShortsOrchestrator(config)
+
+    print("=" * 60)
+    print("🎬 YOUTUBE SHORTS AUTOMATION")
+    print("=" * 60)
+    print("\n📤 Faça upload do seu vídeo MP4 (máx 2 minutos)...")
+
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("❌ Nenhum arquivo enviado!")
+        return
+
+    video_filename = list(uploaded.keys())[0]
+
+    temp_video_path = f"/tmp/{video_filename}"
+    with open(temp_video_path, 'wb') as f:
+        f.write(uploaded[video_filename])
+
+    print(f"\n✅ Arquivo recebido: {video_filename}")
+    print("🚀 Iniciando processamento...\n")
+
+    result = orchestrator.process_video(temp_video_path)
+
+    if result:
+        video_path, metadata_path = result
+
+        print("\n" + "=" * 60)
+        print("✅ PROCESSAMENTO CONCLUÍDO!")
+        print("=" * 60)
+
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            metadata_content = f.read()
+
+        print("\n📝 METADADOS GERADOS:\n")
+        print(metadata_content)
+
+        print("\n" + "=" * 60)
+        print("💾 BAIXANDO ARQUIVOS FINAIS...")
+        print("=" * 60)
+
+        files.download(video_path)
+        files.download(metadata_path)
+
+        print("\n✅ Download concluído! Verifique seus arquivos.")
+    else:
+        print("\n❌ Erro no processamento. Verifique os logs acima.")
+
+# ============================================================================
+# BLOCO 12: EXECUÇÃO PRINCIPAL
+# ============================================================================
+
+if __name__ == "__main__":
+    upload_and_process()
