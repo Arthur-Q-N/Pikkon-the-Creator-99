@@ -1,4 +1,4 @@
-# Codigo em Phyton de Automação de videos no Google Colab
+# Código em Python de Automação de vídeos no Google Colab
 """
 Sistema de Automação Profissional para YouTube Shorts
 Arquitetura Multi-Agente com Pipeline de Processamento Inteligente
@@ -8,9 +8,8 @@ Arquitetura Multi-Agente com Pipeline de Processamento Inteligente
 # BLOCO 1: INSTALAÇÃO DE DEPENDÊNCIAS (Executar primeiro no Colab)
 # ============================================================================
 
-!apt-get update && apt-get install -y ffmpeg
-!pip install -q huggingface_hub requests poe-api ffmpeg-python gradio python-dotenv
-!pip install --upgrade poe-api
+!apt-get -qq update && apt-get -qq install -y ffmpeg
+!pip -q install --upgrade huggingface_hub google-generativeai ffmpeg-python requests
 
 # ============================================================================
 # BLOCO 2: IMPORTS E CONFIGURAÇÃO
@@ -22,15 +21,13 @@ import logging
 import tempfile
 import shutil
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, asdict
 import subprocess
 
-import requests
 from huggingface_hub import InferenceClient
 from google.colab import userdata
 import time
-import gradio as gr
 import google.generativeai as genai
 
 logging.basicConfig(
@@ -65,32 +62,42 @@ class ProcessingPaths:
 
 class ConfigManager:
     def __init__(self):
+        # Leitura por variáveis de ambiente ou Colab Secrets
+        self.hf_api_key = os.getenv('HUGGINGFACE_API_KEY') or os.getenv('HF_TOKEN')
+        self.gemini_api_key = os.getenv('GEMINI_API_KEY')
+
+        # Tente obter do Colab Secrets se ausentes
         try:
-            self.hf_api_key = userdata.get('HUGGINGFACE_API_KEY')
             if not self.hf_api_key:
-                self.hf_api_key = userdata.get('HF_TOKEN')
+                self.hf_api_key = userdata.get('HUGGINGFACE_API_KEY') or userdata.get('HF_TOKEN')
+            if not self.gemini_api_key:
+                self.gemini_api_key = userdata.get('GEMINI_API_KEY')
+        except Exception:
+            # Estamos fora do Colab ou sem Secrets; seguimos com env vars
+            pass
 
-            self.poe_api_key = userdata.get('POE_API_KEY')
-            self.gemini_api_key = userdata.get('GEMINI_API_KEY')
+        # Gemini é obrigatório; HF é opcional (usada como fallback)
+        if not self.gemini_api_key:
+            logger.error("GEMINI_API_KEY ausente. Adicione-a nos Secrets do Colab ou como variável de ambiente.")
+            raise ValueError("GEMINI_API_KEY é obrigatória para executar o pipeline.")
 
-        except Exception as e:
-            logger.error("Configure as API Keys no Colab Secrets (ícone de chave 🔑)")
-            raise ValueError("API Keys não encontradas. Adicione HUGGINGFACE_API_KEY, POE_API_KEY e GEMINI_API_KEY nos Secrets do Colab")
-
-        if not self.hf_api_key or not self.poe_api_key or not self.gemini_api_key:
-            raise ValueError("API Keys vazias. Verifique os Secrets do Colab")
-
-        os.environ['HF_TOKEN'] = self.hf_api_key
-        os.environ['HUGGING_FACE_HUB_TOKEN'] = self.hf_api_key
+        # Exponha tokens para libs que dependem de variáveis de ambiente
+        if self.hf_api_key:
+            os.environ['HF_TOKEN'] = self.hf_api_key
+            os.environ['HUGGING_FACE_HUB_TOKEN'] = self.hf_api_key
 
     def validate_keys(self) -> bool:
-        try:
-            client = InferenceClient(token=self.hf_api_key)
-            logger.info("✓ API Keys validadas com sucesso")
-            return True
-        except Exception as e:
-            logger.error(f"Erro na validação: {e}")
-            return False
+        ok = True
+        if not self.gemini_api_key:
+            logger.error("GEMINI_API_KEY não configurada")
+            ok = False
+        if self.hf_api_key:
+            try:
+                _ = InferenceClient(token=self.hf_api_key)
+            except Exception as e:
+                logger.warning(f"HF_TOKEN inválido ou indisponível: {e}")
+        logger.info("✓ Configuração validada")
+        return ok
 
 # ============================================================================
 # BLOCO 5: PROCESSADOR DE ÁUDIO
@@ -101,7 +108,7 @@ class AudioProcessor:
     def extract_audio(video_path: Path, audio_path: Path) -> bool:
         try:
             cmd = [
-                'ffmpeg', '-i', str(video_path),
+                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', str(video_path),
                 '-vn', '-acodec', 'pcm_s16le',
                 '-ar', '16000', '-ac', '1',
                 str(audio_path), '-y'
@@ -118,18 +125,21 @@ class AudioProcessor:
 # ============================================================================
 
 class TranscriptionService:
-    MODEL = "gemini-2.5-pro"
+    MODEL = "gemini-1.5-pro-latest"
 
-    def __init__(self, gemini_api_key: str):
+    def __init__(self, gemini_api_key: str, hf_api_key: Optional[str] = None):
         genai.configure(api_key=gemini_api_key)
         self.model = genai.GenerativeModel(self.MODEL)
+        self.hf_client: Optional[InferenceClient] = None
+        if hf_api_key:
+            try:
+                self.hf_client = InferenceClient(token=hf_api_key)
+            except Exception as e:
+                logger.warning(f"Falha ao inicializar HuggingFace fallback: {e}")
         logger.info(f"Serviço de transcrição inicializado: {self.MODEL}")
 
     def transcribe(self, audio_path: Path) -> Optional[str]:
         try:
-            with open(audio_path, 'rb') as audio_file:
-                audio_data = audio_file.read()
-
             # Upload do arquivo de áudio para o Gemini
             audio_file = genai.upload_file(path=str(audio_path))
             
@@ -140,11 +150,11 @@ class TranscriptionService:
             
             if audio_file.state.name == "FAILED":
                 logger.error("Falha no upload do arquivo de áudio")
-                return None
+                return self._hf_asr(audio_path)
 
             # Transcrever o áudio
             response = self.model.generate_content([
-                "Transcreva este áudio para texto em português brasileiro. Retorne apenas o texto transcrito, sem formatação adicional.",
+                {"text": "Transcreva este áudio para texto em português brasileiro. Retorne apenas o texto transcrito, sem formatação adicional."},
                 audio_file
             ])
 
@@ -153,7 +163,33 @@ class TranscriptionService:
             return transcription
 
         except Exception as e:
-            logger.error(f"Erro na transcrição: {e}")
+            logger.error(f"Erro na transcrição (Gemini). Ativando fallback HF: {e}")
+            return self._hf_asr(audio_path)
+
+    def _hf_asr(self, audio_path: Path) -> Optional[str]:
+        """Fallback via Hugging Face Inference API (Whisper)."""
+        if not self.hf_client:
+            logger.error("Fallback de transcrição indisponível: HF_TOKEN ausente.")
+            return None
+        try:
+            with open(audio_path, 'rb') as f:
+                audio_bytes = f.read()
+            # Modelos possíveis: 'openai/whisper-large-v3-turbo' ou 'distil-whisper/distil-large-v3'
+            result = self.hf_client.automatic_speech_recognition(
+                audio=audio_bytes,
+                model="openai/whisper-large-v3-turbo"
+            )
+            if isinstance(result, dict) and 'text' in result:
+                text = str(result['text']).strip()
+            else:
+                text = str(result).strip()
+            if not text:
+                logger.error("Fallback HF não retornou texto.")
+                return None
+            logger.info(f"Transcrição (fallback HF) concluída: {len(text)} caracteres")
+            return text
+        except Exception as e:
+            logger.error(f"Erro no fallback de transcrição (HF): {e}")
             return None
 
 # ============================================================================
@@ -300,23 +336,40 @@ Retorne **APENAS** o JSON abaixo, sem explicações, comentários ou texto adici
 
 **LEMBRE-SE**: Você gera 5 títulos internamente, escolhe o melhor e retorna APENAS o JSON final. Sem explicações extras."""
 
-    def __init__(self, hf_api_key: str):
-        self.client = InferenceClient(token=hf_api_key)
-        logger.info(f"Agente 1 inicializado: {self.MODEL}")
+    def __init__(self, hf_api_key: Optional[str], gemini_api_key: str):
+        self.hf_client: Optional[InferenceClient] = None
+        if hf_api_key:
+            try:
+                self.hf_client = InferenceClient(token=hf_api_key)
+            except Exception as e:
+                logger.warning(f"Falha ao inicializar HF para Agente1: {e}")
+        genai.configure(api_key=gemini_api_key)
+        self.gemini_model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        logger.info("Agente 1 inicializado (HF → fallback Gemini)")
 
     def generate_metadata(self, transcription: str, feedback: Optional[str] = None) -> Optional[Dict]:
         try:
             prompt = self._build_prompt(transcription, feedback)
 
-            response = self.client.text_generation(
-                prompt,
-                model=self.MODEL,
-                max_new_tokens=1000,
-                temperature=0.7,
-                return_full_text=False
-            )
+            response_text: str
+            if self.hf_client:
+                try:
+                    response_text = self.hf_client.text_generation(
+                        prompt,
+                        model=self.MODEL,
+                        max_new_tokens=1000,
+                        temperature=0.7,
+                        return_full_text=False
+                    )
+                except Exception as e:
+                    logger.warning(f"HF geração falhou, usando Gemini: {e}")
+                    gem_resp = self.gemini_model.generate_content(prompt)
+                    response_text = gem_resp.text
+            else:
+                gem_resp = self.gemini_model.generate_content(prompt)
+                response_text = gem_resp.text
 
-            metadata = self._parse_response(response)
+            metadata = self._parse_response(response_text)
             logger.info("Metadados gerados pelo Agente 1")
             return metadata
 
@@ -353,7 +406,27 @@ IMPORTANTE: Incorpore todas as sugestões de melhoria mantendo a estrutura JSON.
             start_idx = response.find('{')
             end_idx = response.rfind('}') + 1
             json_str = response[start_idx:end_idx]
-            return json.loads(json_str)
+            data = json.loads(json_str)
+            # Normalização de campos
+            titulo = str(data.get("titulo", "")).strip() or "Título Padrão"
+            descricao = str(data.get("descricao", "")).strip() or "Descrição padrão. #shorts"
+            tags_raw = data.get("tags", [])
+            tags: List[str]
+            if isinstance(tags_raw, str):
+                tags = [t.strip().lower() for t in tags_raw.split(',') if t.strip()]
+            elif isinstance(tags_raw, list):
+                tags = [str(t).strip().lower() for t in tags_raw if str(t).strip()]
+            else:
+                tags = ["shorts", "viral", "trending"]
+            # Garante no mínimo 5 tags e presença de 'shorts'
+            if "shorts" not in tags:
+                tags.append("shorts")
+            tags = tags[:30] if len(tags) > 30 else tags
+            return {
+                "titulo": titulo,
+                "descricao": descricao,
+                "tags": tags
+            }
         except:
             return {
                 "titulo": "Título Padrão",
@@ -366,8 +439,7 @@ IMPORTANTE: Incorpore todas as sugestões de melhoria mantendo a estrutura JSON.
 # ============================================================================
 
 class Agent2Optimizer:
-    MODEL = "Claude-Sonnet-3.5"
-    API_URL = "https://api.poe.com/bot/chat"
+    MODEL = "gemini-1.5-pro-latest"
 
     SYSTEM_PROMPT = """ 🔍 AGENTE CRÍTICO DE SEO VIRAL — YouTube Shorts 2025
 
@@ -583,40 +655,18 @@ Você é o ÚLTIMO filtro de qualidade antes da publicação. Sua análise crít
 
 **NÃO RETORNE JSON. Retorne APENAS a análise em texto corrido conforme o formato acima."""
 
-    def __init__(self, poe_api_key: str):
-        self.api_key = poe_api_key
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Authorization': f'Bearer {poe_api_key}',
-            'Content-Type': 'application/json'
-        })
-        logger.info(f"Agente 2 inicializado: {self.MODEL}")
+    def __init__(self, gemini_api_key: str):
+        genai.configure(api_key=gemini_api_key)
+        self.model = genai.GenerativeModel(self.MODEL)
+        logger.info("Agente 2 inicializado (Gemini)")
 
     def analyze_and_optimize(self, metadata: Dict) -> Tuple[str, float]:
         try:
             prompt = self._build_analysis_prompt(metadata)
 
-            payload = {
-                "version": "1.0",
-                "type": "query",
-                "query": [{
-                    "role": "user",
-                    "content": prompt
-                }],
-                "bot": self.MODEL
-            }
-
-            response = self.session.post(
-                self.API_URL,
-                json=payload,
-                timeout=60
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                analysis_text = result.get('text', 'Análise indisponível')
-            else:
-                logger.warning(f"API Poe retornou status {response.status_code}")
+            response = self.model.generate_content(prompt)
+            analysis_text = (response.text or "").strip()
+            if not analysis_text:
                 analysis_text = self._fallback_analysis(metadata)
 
             viral_score = self._extract_viral_score(analysis_text)
@@ -719,9 +769,9 @@ class VideoCompiler:
 class YouTubeShortsOrchestrator:
     def __init__(self, config: ConfigManager):
         self.config = config
-        self.transcriber = TranscriptionService(config.gemini_api_key)
-        self.agent1 = Agent1ContentGenerator(config.hf_api_key)
-        self.agent2 = Agent2Optimizer(config.poe_api_key)
+        self.transcriber = TranscriptionService(config.gemini_api_key, hf_api_key=config.hf_api_key)
+        self.agent1 = Agent1ContentGenerator(config.hf_api_key, config.gemini_api_key)
+        self.agent2 = Agent2Optimizer(config.gemini_api_key)
         self.audio_processor = AudioProcessor()
         self.video_compiler = VideoCompiler()
 
@@ -755,9 +805,9 @@ class YouTubeShortsOrchestrator:
                 metadata_final = metadata_v1
 
             video_metadata = VideoMetadata(
-                titulo=metadata_final['titulo'],
-                descricao=metadata_final['descricao'],
-                tags=metadata_final['tags'],
+                titulo=str(metadata_final.get('titulo', 'Título Padrão')),
+                descricao=str(metadata_final.get('descricao', 'Descrição padrão. #shorts')),
+                tags=metadata_final.get('tags', ['shorts']),
                 analise_agente2=feedback,
                 score_viral=viral_score
             )
@@ -813,7 +863,7 @@ def upload_and_process():
     print("=" * 60)
     print("🎬 YOUTUBE SHORTS AUTOMATION")
     print("=" * 60)
-    print("\n📤 Faça upload do seu vídeo MP4 (máx 2 minutos)...")
+    print("\n📤 Faça upload do seu vídeo MP4 (duração recomendada: até 2 minutos)...")
 
     uploaded = files.upload()
 
@@ -829,6 +879,11 @@ def upload_and_process():
 
     print(f"\n✅ Arquivo recebido: {video_filename}")
     print("🚀 Iniciando processamento...\n")
+
+    # Valida chaves antes de iniciar
+    if not config.validate_keys():
+        print("❌ Configuração inválida. Verifique as chaves de API.")
+        return
 
     result = orchestrator.process_video(temp_video_path)
 
