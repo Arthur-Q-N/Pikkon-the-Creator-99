@@ -125,7 +125,7 @@ class AudioProcessor:
 # ============================================================================
 
 class TranscriptionService:
-    MODEL = "gemini-1.5-pro-latest"
+    MODEL = "gemini-2.5-pro"
 
     def __init__(self, gemini_api_key: str, hf_api_key: Optional[str] = None):
         genai.configure(api_key=gemini_api_key)
